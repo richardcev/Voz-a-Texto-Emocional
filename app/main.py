@@ -28,9 +28,10 @@ sentiment_classifier = pipeline(
     model="tabularisai/multilingual-sentiment-analysis"
 )
 
-
+#Returns 7 emotions:
+#[neutral, fear, anger, sadness, joy, surprise, disgust]
 @app.post("/transcribe/emotion")
-async def transcribe_audio(file: UploadFile = File(...)):
+async def transcribe_emotion(file: UploadFile = File(...)):
     # Guardar el archivo temporalmente
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(await file.read())
@@ -141,8 +142,10 @@ async def audio_emotions(file: UploadFile = File(...)):
 
 
 
+#Return 5 sentiments:
+#[negative, positive, neutral, very negative, very positive]
 @app.post("/transcribe/sentiment")
-async def transcribe_sentiment_multi(file: UploadFile = File(...)):
+async def transcribe_sentiment(file: UploadFile = File(...)):
     # Guardar el archivo temporalmente
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(await file.read())
