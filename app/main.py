@@ -8,7 +8,8 @@ from pysentimiento import create_analyzer
 
 app = FastAPI(title="Whisper Transcription API")
 
-model = whisper.load_model("small")
+model_name = os.getenv("WHISPER_MODEL", "base")
+model = whisper.load_model(model_name)
 
 #Modelo base, emociones en texto 
 emotion_classifier = pipeline(
