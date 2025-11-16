@@ -4,6 +4,7 @@ import tempfile
 import os
 from transformers import pipeline
 from collections import defaultdict
+from pysentimiento import create_analyzer
 
 app = FastAPI(title="Whisper Transcription API")
 
@@ -27,6 +28,10 @@ sentiment_classifier = pipeline(
     "text-classification",
     model="tabularisai/multilingual-sentiment-analysis"
 )
+
+#pysentimiento
+pysentimiento_emotion_es = create_analyzer(task="emotion", lang="es")
+
 
 #Returns 7 emotions:
 #[neutral, fear, anger, sadness, joy, surprise, disgust]
@@ -215,6 +220,84 @@ async def transcribe_sentiment(file: UploadFile = File(...)):
             "global_sentiments": global_sentiments_sorted,
             "top_global_sentiments": top_global_sentiments,
             "segments": segment_sentiments
+        }
+
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+@app.post("/transcribe/pysentimiento-emotion-es")
+async def transcribe_pysentimiento_emotion_es(file: UploadFile = File(...)):
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+
+    try:
+        # 1. Transcripción con Whisper
+        result = model.transcribe(tmp_path)
+        text = result["text"]
+        segments = result.get("segments", [])
+
+        segment_emotions = []
+
+        # Para emociones globales ponderadas
+        global_scores = defaultdict(float)
+        total_weight = 0.0
+
+        for seg in segments:
+            seg_text = seg.get("text", "").strip()
+            if not seg_text:
+                continue
+
+            # 2. Emociones con pysentimiento (ES)
+            emotion_result = pysentimiento_emotion_es.predict(seg_text)
+            # emotion_result.probas -> dict {alegría: 0.3, tristeza: 0.1, ...}
+            emotions = [
+                {"label": label, "score": float(score)}
+                for label, score in emotion_result.probas.items()
+            ]
+
+            if not emotions:
+                continue
+
+            # Top emoción del segmento
+            top_emotion = max(emotions, key=lambda x: x["score"])
+
+            # 3. Peso del segmento (duración)
+            duration = float(seg.get("end", 0) - seg.get("start", 0)) or 1.0
+            weight = duration
+            total_weight += weight
+
+            for e in emotions:
+                global_scores[e["label"]] += e["score"] * weight
+
+            segment_emotions.append({
+                "start": float(seg.get("start", 0.0)),
+                "end": float(seg.get("end", 0.0)),
+                "text": seg_text,
+                "top_emotion": top_emotion,
+                "emotions": emotions,
+            })
+
+        # 4. Emociones globales (promedio ponderado)
+        global_emotions = []
+        if total_weight > 0:
+            for label, score_sum in global_scores.items():
+                global_emotions.append({
+                    "label": label,
+                    "score": float(score_sum / total_weight)
+                })
+
+        global_emotions_sorted = sorted(global_emotions, key=lambda x: x["score"], reverse=True)
+        top_global_emotions = global_emotions_sorted[:3]
+
+        return {
+            "transcription": text,
+            "global_emotions": global_emotions_sorted,
+            "top_global_emotions": top_global_emotions,
+            "segments": segment_emotions
         }
 
     finally:
