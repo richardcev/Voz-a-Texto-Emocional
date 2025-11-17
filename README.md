@@ -52,10 +52,14 @@ a_init_uide_tesis/
 └── ...
 ```
 
+
+### Train
 ```sh
-# 
+# 1.
 python training/train_emotion_model.py
 
-# 
+# 2.
+uvicorn app.main:app --reload --host 0.0.0.0 --port 7777
+
 ```
 

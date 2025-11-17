@@ -1,6 +1,7 @@
 import os
 import tempfile
 from collections import defaultdict
+from pathlib import Path
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +17,29 @@ WHISPER_MODEL_NAME = os.getenv(
 )  # "tiny", "base", "small", etc.
 
 DEVICE = 0 if torch.cuda.is_available() else -1
+
+#  ----------------->
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+FT_EMOTION_MODEL_PATH = os.getenv(
+    "FT_EMOTION_MODEL_PATH", str(BASE_DIR / "models" / "emotion_es_bert_colombia")
+)
+
+if os.path.isdir(FT_EMOTION_MODEL_PATH):
+    print(f"Cargando modelo fine-tuned de emociones ES desde: {FT_EMOTION_MODEL_PATH}")
+    emotion_es_ft = pipeline(
+        "text-classification",
+        model=FT_EMOTION_MODEL_PATH,
+        tokenizer=FT_EMOTION_MODEL_PATH,
+        return_all_scores=True,
+        device=DEVICE,
+    )
+else:
+    print("⚠️  Modelo fine-tuned ES no encontrado, FT deshabilitado.")
+    emotion_es_ft = None
+
+#  ----------------->
+
 
 app = FastAPI(
     title="Sistema Voz a Texto con Análisis Emocional",
@@ -397,6 +421,98 @@ async def transcribe_pysentimiento_emotion_es(file: UploadFile = File(...)):
         raise HTTPException(
             status_code=500,
             detail=f"Error en emociones (pysentimiento ES): {str(e)}",
+        )
+    finally:
+        delete_temp_file(tmp_path)
+
+
+# #### FAINE-TUNED ================================================================
+# TRANSCRIPTION + EMOTIONS (ES, modelo fine-tuned) ---------------
+@app.post("/transcribe/emotion-es-ft")
+async def transcribe_emotion_es_ft(file: UploadFile = File(...)):
+    """
+    Transcribe el audio (español) y analiza emociones en el TEXTO
+    usando el modelo BERT fine-tuned en pysentimiento/emociones_colombia.
+    """
+    if emotion_es_ft is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Modelo fine-tuned de emociones ES no disponible. "
+                "Asegúrate de haber entrenado y guardado en models/emotion_es_bert_colombia."
+            ),
+        )
+
+    ensure_audio(file)
+    tmp_path = save_temp_file(file, suffix=".wav")
+
+    try:
+        result = asr_model.transcribe(tmp_path, language="es")
+        text = result.get("text", "").strip()
+        segments = result.get("segments", [])
+
+        segment_emotions = []
+        global_scores = defaultdict(float)
+        total_weight = 0.0
+
+        for seg in segments:
+            seg_text = seg.get("text", "").strip()
+            if not seg_text:
+                continue
+
+            # Emociones con modelo fine-tuned
+            em_result = emotion_es_ft(seg_text, top_k=None)
+            emotions = [
+                {"label": e["label"], "score": float(e["score"])} for e in em_result
+            ]
+
+            if not emotions:
+                continue
+
+            top_emotion = max(emotions, key=lambda x: x["score"])
+
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", 0.0))
+            duration = max(end - start, 0.1)
+            weight = duration
+            total_weight += weight
+
+            for e in emotions:
+                global_scores[e["label"]] += e["score"] * weight
+
+            segment_emotions.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "text": seg_text,
+                    "top_emotion": top_emotion,
+                    "emotions": emotions,
+                }
+            )
+
+        global_emotions = []
+        if total_weight > 0:
+            for label, score_sum in global_scores.items():
+                global_emotions.append(
+                    {"label": label, "score": float(score_sum / total_weight)}
+                )
+
+        global_emotions_sorted = sorted(
+            global_emotions, key=lambda x: x["score"], reverse=True
+        )
+        top_global_emotions = global_emotions_sorted[:3]
+
+        return {
+            "transcription": text,
+            "global_emotions": global_emotions_sorted,
+            "top_global_emotions": top_global_emotions,
+            "segments": segment_emotions,
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error en emociones (ES fine-tuned): {str(e)}",
         )
     finally:
         delete_temp_file(tmp_path)
