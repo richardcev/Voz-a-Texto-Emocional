@@ -1,56 +1,147 @@
-from fastapi import FastAPI, UploadFile, File
-import whisper
-import tempfile
 import os
-from transformers import pipeline
+import tempfile
 from collections import defaultdict
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+import whisper
+import torch
+from transformers import pipeline
 from pysentimiento import create_analyzer
 
-app = FastAPI(title="Whisper Transcription API")
 
-model_name = os.getenv("WHISPER_MODEL", "base")
-model = whisper.load_model(model_name)
+WHISPER_MODEL_NAME = os.getenv(
+    "WHISPER_MODEL", "small"
+)  # "tiny", "base", "small", etc.
 
-#Modelo base, emociones en texto 
-emotion_classifier = pipeline(
-    "text-classification",
-    model="j-hartmann/emotion-english-distilroberta-base",
-    return_all_scores=True
+DEVICE = 0 if torch.cuda.is_available() else -1
+
+app = FastAPI(
+    title="Sistema Voz a Texto con Análisis Emocional",
+    description="API para transcripción (Whisper) y detección de emociones/sentimiento en español/inglés.",
+    version="1.0.0",
 )
 
-#Modelo para extraer emociones directamente del audio
+# CORS ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # control in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ### Load models once at startup ==================================
+print(f"Cargando modelo Whisper: {WHISPER_MODEL_NAME}")
+asr_model = whisper.load_model(WHISPER_MODEL_NAME)
+
+# Emociones en texto en inglés (baseline, HuggingFace)
+print("Cargando modelo de emociones en texto (inglés)...")
+emotion_en_classifier = pipeline(
+    "text-classification",
+    model="j-hartmann/emotion-english-distilroberta-base",
+    return_all_scores=True,
+    device=DEVICE,
+)
+
+# Emociones en audio (SER)
+print("Cargando modelo de emociones en audio (SER)...")
 audio_emotion_classifier = pipeline(
     "audio-classification",
-    model="superb/wav2vec2-base-superb-er"
+    model="superb/wav2vec2-base-superb-er",
+    device=DEVICE,
 )
 
 # Sentimiento multilingüe
+print("Cargando modelo de sentimiento multilingüe...")
 sentiment_classifier = pipeline(
     "text-classification",
-    model="tabularisai/multilingual-sentiment-analysis"
+    model="tabularisai/multilingual-sentiment-analysis",
+    return_all_scores=True,
+    device=DEVICE,
 )
 
-#pysentimiento
+# Emociones en texto español (pysentimiento)
+print("Inicializando pysentimiento (emociones ES)...")
 pysentimiento_emotion_es = create_analyzer(task="emotion", lang="es")
 
 
-#Returns 7 emotions:
-#[neutral, fear, anger, sadness, joy, surprise, disgust]
-@app.post("/transcribe/emotion")
-async def transcribe_emotion(file: UploadFile = File(...)):
-    # Guardar el archivo temporalmente
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+# ### Helpers ======================================================
+def save_temp_file(upload_file: UploadFile, suffix: str = "") -> str:
+    """Guarda el UploadFile en un archivo temporal y devuelve la ruta."""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(upload_file.file.read())
+            return tmp.name
+    finally:
+        upload_file.file.close()
+
+
+def delete_temp_file(path: str):
+    if path and os.path.exists(path):
+        os.remove(path)
+
+
+def ensure_audio(file: UploadFile):
+    if not file.content_type.startswith("audio"):
+        raise HTTPException(status_code=400, detail="El archivo debe ser de audio.")
+
+
+# ### Endpoints ==================================================
+# TRANSCRIPTION + EMOTIONS / SENTIMENT -------
+@app.post("/transcribe")
+async def transcribe(file: UploadFile = File(...)):
+    """
+    Transcribe un audio (idealmente en español) usando Whisper.
+    Devuelve texto completo y segmentos con tiempos.
+    """
+    ensure_audio(file)
+    tmp_path = save_temp_file(file, suffix=".wav")
 
     try:
-        # Transcribir con Whisper (ya devuelve segmentos)
-        result = model.transcribe(tmp_path)
-        text = result["text"]
+        result = asr_model.transcribe(tmp_path, language="es")  # fuerza español
+        text = result.get("text", "").strip()
+        segments = result.get("segments", [])
+
+        segment_list = [
+            {
+                "start": float(seg.get("start", 0.0)),
+                "end": float(seg.get("end", 0.0)),
+                "text": seg.get("text", "").strip(),
+            }
+            for seg in segments
+        ]
+
+        return {
+            "transcription": text,
+            "segments": segment_list,
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en transcripción: {str(e)}")
+    finally:
+        delete_temp_file(tmp_path)
+
+
+# TRANSCRIPTION + EMOTIONS (EN) ---------------
+@app.post("/transcribe/emotion-en")
+async def transcribe_emotion_en(file: UploadFile = File(...)):
+    """
+    Transcribe el audio y analiza emociones del TEXTO usando
+    un modelo de emociones en inglés (HuggingFace).
+    Útil si el audio está en inglés.
+    """
+    ensure_audio(file)
+    tmp_path = save_temp_file(file, suffix=".wav")
+
+    try:
+        result = asr_model.transcribe(tmp_path)  # idioma auto
+        text = result.get("text", "").strip()
         segments = result.get("segments", [])
 
         segment_emotions = []
-        # Para calcular emociones "globales" promediadas
         global_scores = defaultdict(float)
         total_weight = 0.0
 
@@ -59,112 +150,110 @@ async def transcribe_emotion(file: UploadFile = File(...)):
             if not seg_text:
                 continue
 
-            # Clasificar emociones en este segmento
-            em_result = emotion_classifier(seg_text)  # [[{label, score}, ...]]
-            raw_emotions = em_result[0]
-
+            em_result = emotion_en_classifier(seg_text, top_k=None)[0]
             emotions = [
-                {"label": e["label"], "score": float(e["score"])}
-                for e in raw_emotions
+                {"label": e["label"], "score": float(e["score"])} for e in em_result
             ]
 
-            # Top emoción del segmento
+            if not emotions:
+                continue
+
             top_emotion = max(emotions, key=lambda x: x["score"])
 
-            # Peso del segmento para el promedio global
-            # Puedes usar duración (end - start) o longitud del texto
-            duration = float(seg.get("end", 0) - seg.get("start", 0)) or 1.0
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", 0.0))
+            duration = max(end - start, 0.1)
             weight = duration
             total_weight += weight
 
             for e in emotions:
                 global_scores[e["label"]] += e["score"] * weight
 
-            segment_emotions.append({
-                "start": float(seg.get("start", 0.0)),
-                "end": float(seg.get("end", 0.0)),
-                "text": seg_text,
-                "top_emotion": top_emotion,
-                "emotions": emotions,
-            })
+            segment_emotions.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "text": seg_text,
+                    "top_emotion": top_emotion,
+                    "emotions": emotions,
+                }
+            )
 
-        # Calcular emociones globales promediadas
         global_emotions = []
         if total_weight > 0:
             for label, score_sum in global_scores.items():
-                global_emotions.append({
-                    "label": label,
-                    "score": float(score_sum / total_weight)
-                })
+                global_emotions.append(
+                    {"label": label, "score": float(score_sum / total_weight)}
+                )
 
-        # Ordenar globales
-        global_emotions_sorted = sorted(global_emotions, key=lambda x: x["score"], reverse=True)
+        global_emotions_sorted = sorted(
+            global_emotions, key=lambda x: x["score"], reverse=True
+        )
         top_global_emotions = global_emotions_sorted[:3]
 
         return {
             "transcription": text,
             "global_emotions": global_emotions_sorted,
             "top_global_emotions": top_global_emotions,
-            "segments": segment_emotions
+            "segments": segment_emotions,
         }
 
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Error en emociones (texto-EN): {str(e)}"
+        )
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        delete_temp_file(tmp_path)
 
 
-@app.post("/audio-emotions/")
+# Emotions from audio (SER) --------------
+@app.post("/audio-emotions")
 async def audio_emotions(file: UploadFile = File(...)):
     """
-    Retorna emociones detectadas directamente de la voz,
-    usando superb/wav2vec2-base-superb-er.
+    Analiza emociones directamente desde la voz (tono) usando
+    superb/wav2vec2-base-superb-er.
+    Devuelve lista de emociones ordenadas por score.
     """
-    # Guardar archivo temporalmente
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+    ensure_audio(file)
+    tmp_path = save_temp_file(file, suffix=".wav")
 
     try:
-        # top_k=None → devuelve todas las etiquetas del modelo
         results = audio_emotion_classifier(tmp_path, top_k=None)
 
-        emotions = [
-            {"label": r["label"], "score": float(r["score"])}
-            for r in results
-        ]
+        emotions = [{"label": r["label"], "score": float(r["score"])} for r in results]
 
-        # Ordenar de mayor a menor score
         emotions_sorted = sorted(emotions, key=lambda x: x["score"], reverse=True)
         top_emotion = emotions_sorted[0] if emotions_sorted else None
 
         return {
             "emotions": emotions_sorted,
-            "top_emotion": top_emotion
+            "top_emotion": top_emotion,
         }
 
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Error en emociones de audio: {str(e)}"
+        )
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        delete_temp_file(tmp_path)
 
 
-
-#Return 5 sentiments:
-#[negative, positive, neutral, very negative, very positive]
+# TRANSCRIPTION + SENTIMENT Multilingüe ---------------
 @app.post("/transcribe/sentiment")
 async def transcribe_sentiment(file: UploadFile = File(...)):
-    # Guardar el archivo temporalmente
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+    """
+    Transcribe el audio y analiza SENTIMIENTO (positivo / negativo / neutro, etc.)
+    usando un modelo multilingüe (tabularisai).
+    """
+    ensure_audio(file)
+    tmp_path = save_temp_file(file, suffix=".wav")
 
     try:
-        # Transcribir con Whisper (ya devuelve segmentos)
-        result = model.transcribe(tmp_path)
-        text = result["text"]
+        result = asr_model.transcribe(tmp_path)  # idioma auto
+        text = result.get("text", "").strip()
         segments = result.get("segments", [])
 
         segment_sentiments = []
-        # Para calcular sentimientos "globales" promediados
         global_scores = defaultdict(float)
         total_weight = 0.0
 
@@ -173,77 +262,78 @@ async def transcribe_sentiment(file: UploadFile = File(...)):
             if not seg_text:
                 continue
 
-            # Clasificar SENTIMIENTO en este segmento
-            # top_k=None devuelve todas las clases (1–5 stars)
-            sent_result = sentiment_classifier(seg_text, top_k=None)
-
+            sent_result = sentiment_classifier(seg_text, top_k=None)[0]
             sentiments = [
-                {"label": r["label"], "score": float(r["score"])}
-                for r in sent_result
+                {"label": s["label"], "score": float(s["score"])} for s in sent_result
             ]
+
             if not sentiments:
                 continue
 
-            # Top sentimiento del segmento
             top_sentiment = max(sentiments, key=lambda x: x["score"])
 
-            # Peso del segmento para el promedio global
-            duration = float(seg.get("end", 0) - seg.get("start", 0)) or 1.0
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", 0.0))
+            duration = max(end - start, 0.1)
             weight = duration
             total_weight += weight
 
             for s in sentiments:
                 global_scores[s["label"]] += s["score"] * weight
 
-            segment_sentiments.append({
-                "start": float(seg.get("start", 0.0)),
-                "end": float(seg.get("end", 0.0)),
-                "text": seg_text,
-                "top_sentiment": top_sentiment,
-                "sentiments": sentiments,
-            })
+            segment_sentiments.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "text": seg_text,
+                    "top_sentiment": top_sentiment,
+                    "sentiments": sentiments,
+                }
+            )
 
-        # Calcular sentimientos globales promediados
         global_sentiments = []
         if total_weight > 0:
             for label, score_sum in global_scores.items():
-                global_sentiments.append({
-                    "label": label,
-                    "score": float(score_sum / total_weight)
-                })
+                global_sentiments.append(
+                    {"label": label, "score": float(score_sum / total_weight)}
+                )
 
-        # Ordenar globales
-        global_sentiments_sorted = sorted(global_sentiments, key=lambda x: x["score"], reverse=True)
+        global_sentiments_sorted = sorted(
+            global_sentiments, key=lambda x: x["score"], reverse=True
+        )
         top_global_sentiments = global_sentiments_sorted[:3]
 
         return {
             "transcription": text,
             "global_sentiments": global_sentiments_sorted,
             "top_global_sentiments": top_global_sentiments,
-            "segments": segment_sentiments
+            "segments": segment_sentiments,
         }
 
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Error en análisis de sentimiento: {str(e)}"
+        )
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        delete_temp_file(tmp_path)
 
 
+# TRANSCRIPTION + EMOTIONS (ES, pysentimiento) ---------------
 @app.post("/transcribe/pysentimiento-emotion-es")
 async def transcribe_pysentimiento_emotion_es(file: UploadFile = File(...)):
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+    """
+    Transcribe el audio (español) y analiza emociones en el TEXTO
+    usando pysentimiento (modelo entrenado para ES).
+    """
+    ensure_audio(file)
+    tmp_path = save_temp_file(file, suffix=".wav")
 
     try:
-        # 1. Transcripción con Whisper
-        result = model.transcribe(tmp_path)
-        text = result["text"]
+        result = asr_model.transcribe(tmp_path, language="es")
+        text = result.get("text", "").strip()
         segments = result.get("segments", [])
 
         segment_emotions = []
-
-        # Para emociones globales ponderadas
         global_scores = defaultdict(float)
         total_weight = 0.0
 
@@ -252,9 +342,9 @@ async def transcribe_pysentimiento_emotion_es(file: UploadFile = File(...)):
             if not seg_text:
                 continue
 
-            # 2. Emociones con pysentimiento (ES)
+            # pysentimiento
             emotion_result = pysentimiento_emotion_es.predict(seg_text)
-            # emotion_result.probas -> dict {alegría: 0.3, tristeza: 0.1, ...}
+            # emotion_result.probas es un dict: { 'alegría': 0.3, 'tristeza': 0.1, ... }
             emotions = [
                 {"label": label, "score": float(score)}
                 for label, score in emotion_result.probas.items()
@@ -263,44 +353,50 @@ async def transcribe_pysentimiento_emotion_es(file: UploadFile = File(...)):
             if not emotions:
                 continue
 
-            # Top emoción del segmento
             top_emotion = max(emotions, key=lambda x: x["score"])
 
-            # 3. Peso del segmento (duración)
-            duration = float(seg.get("end", 0) - seg.get("start", 0)) or 1.0
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", 0.0))
+            duration = max(end - start, 0.1)
             weight = duration
             total_weight += weight
 
             for e in emotions:
                 global_scores[e["label"]] += e["score"] * weight
 
-            segment_emotions.append({
-                "start": float(seg.get("start", 0.0)),
-                "end": float(seg.get("end", 0.0)),
-                "text": seg_text,
-                "top_emotion": top_emotion,
-                "emotions": emotions,
-            })
+            segment_emotions.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "text": seg_text,
+                    "top_emotion": top_emotion,
+                    "emotions": emotions,
+                }
+            )
 
-        # 4. Emociones globales (promedio ponderado)
         global_emotions = []
         if total_weight > 0:
             for label, score_sum in global_scores.items():
-                global_emotions.append({
-                    "label": label,
-                    "score": float(score_sum / total_weight)
-                })
+                global_emotions.append(
+                    {"label": label, "score": float(score_sum / total_weight)}
+                )
 
-        global_emotions_sorted = sorted(global_emotions, key=lambda x: x["score"], reverse=True)
+        global_emotions_sorted = sorted(
+            global_emotions, key=lambda x: x["score"], reverse=True
+        )
         top_global_emotions = global_emotions_sorted[:3]
 
         return {
             "transcription": text,
             "global_emotions": global_emotions_sorted,
             "top_global_emotions": top_global_emotions,
-            "segments": segment_emotions
+            "segments": segment_emotions,
         }
 
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error en emociones (pysentimiento ES): {str(e)}",
+        )
     finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        delete_temp_file(tmp_path)
