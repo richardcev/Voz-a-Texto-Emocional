@@ -61,5 +61,11 @@ python training/train_emotion_model.py
 # 2.
 uvicorn app.main:app --reload --host 0.0.0.0 --port 7777
 
+
+# 3. other model ---
+pip install soundfile
+pip install "huggingface_hub[cli]"
+
+python training/train_audio_emotion_mspmea.py
 ```
 
