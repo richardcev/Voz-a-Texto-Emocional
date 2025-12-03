@@ -158,7 +158,7 @@ async def analyze_emotions_openai(text: str):
         ]
 
 @app.post("/transcribe/emotion/openai")
-async def transcribe_emotion(file: UploadFile = File(...)):
+async def transcribe_emotion_openai(file: UploadFile = File(...)):
     # 1. Guardar archivo temporal
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         tmp.write(await file.read())
