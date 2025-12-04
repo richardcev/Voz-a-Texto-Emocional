@@ -39,7 +39,7 @@ El sistema integra múltiples modelos de IA para diferentes tareas:
 
 1.  **Clonar el repositorio:**
     ```bash
-    git clone [https://github.com/tu-usuario/thesis-audio-analysis.git](https://github.com/tu-usuario/thesis-audio-analysis.git)
+    git clone https://github.com/richardcev/Voz-a-Texto-Emocional.git
     cd thesis-audio-analysis
     ```
 
